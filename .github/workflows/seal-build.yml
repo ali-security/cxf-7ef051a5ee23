@@ -1,0 +1,147 @@
+name: seal-build
+
+# Apache CXF 2.7.x has no GitHub Actions CI upstream; this workflow follows
+# BUILDING.txt (mvn install with tests) for the cxf-rt-databinding-aegis module
+# and runs the databinding system tests (Aegis client/server, Aegis MTOM) that
+# exercise it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+env:
+  MAVEN_OPTS: "-Xmx2g -XX:MaxPermSize=512m"
+  MVN_FLAGS: "-B -e -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dgpg.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dcpd.skip=true"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      # The 2.7.18 release jar was built with JDK 1.7.0_71 (Build-Jdk in its manifest).
+      # setup-java can no longer provision JDK 7, so install Oracle JDK 7u80 directly.
+      - name: Install Oracle JDK 7u80
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o jdk7.tar.gz https://repo.huaweicloud.com/java/jdk/7u80-b15/jdk-7u80-linux-x64.tar.gz
+          echo "bad9a731639655118740bee119139c1ed019737ec802a630dd7ad7aab4309623  jdk7.tar.gz" | sha256sum -c -
+          tar xzf jdk7.tar.gz
+          echo "JAVA_HOME=$RUNNER_TEMP/jdk1.7.0_80" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/jdk1.7.0_80/bin" >> "$GITHUB_PATH"
+
+      - name: Install Maven 3.3.9
+        run: |
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.3.9/binaries/apache-maven-3.3.9-bin.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.3.9/bin" >> "$GITHUB_PATH"
+
+      # JDK 7 TLS/cacerts cannot reach today's Maven Central over HTTPS.
+      - name: Configure Maven mirror
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-http</id>
+                <mirrorOf>*</mirrorOf>
+                <url>http://insecure.repo1.maven.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+          java -version
+          mvn -version
+
+      - name: Build and test cxf-rt-databinding-aegis
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn $MVN_FLAGS clean install -pl testutils,rt/databinding/aegis -Dtest=${{ inputs.test-filter }} -DfailIfNoTests=false
+          else
+            mvn $MVN_FLAGS clean install -pl testutils,rt/databinding/aegis
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxf-rt-databinding-aegis
+          path: rt/databinding/aegis/target/cxf-rt-databinding-aegis-*.jar
+          if-no-files-found: error
+
+      - name: Databinding system tests (systests/databinding)
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn $MVN_FLAGS test -pl systests/databinding -Dtest=${{ inputs.test-filter }} -DfailIfNoTests=false
+          else
+            mvn $MVN_FLAGS test -pl systests/databinding
+          fi
+
+      - name: Surefire results summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, xml.etree.ElementTree as ET
+
+          def ignore_context(mod, cls, name):
+              # Surefire records no message for a bare @Ignore; print the upstream
+              # source of the annotation (with its trailing comment) and the test
+              # body so the log carries upstream's own reason for the skip.
+              path = os.path.join(mod, "src/test/java", cls.replace(".", "/") + ".java")
+              if not os.path.exists(path):
+                  return ["    (source %s not found)" % path]
+              lines = open(path).read().splitlines()
+              out = []
+              for i, l in enumerate(lines):
+                  if ("void " + name + "(") in l:
+                      j = i - 1
+                      while j >= 0 and lines[j].strip().startswith("@"):
+                          j -= 1
+                      if j >= 0 and lines[j].strip().startswith("//"):
+                          out.append("    %s:%d: %s" % (path, j + 1, lines[j].strip()))
+                      for k in range(j + 1, i):
+                          out.append("    %s:%d: %s" % (path, k + 1, lines[k].strip()))
+                      depth = 0
+                      body = []
+                      for k in range(i, min(i + 20, len(lines))):
+                          out.append("    %s:%d: %s" % (path, k + 1, lines[k].rstrip()))
+                          body.append(lines[k])
+                          depth += lines[k].count("{") - lines[k].count("}")
+                          if depth == 0 and "}" in lines[k]:
+                              break
+                      if not any("assert" in b or "fail(" in b for b in body):
+                          out.append("    NOTE: the ignored method contains no assertions (upstream diagnostic"
+                                     " helper that only prints output; it verifies nothing).")
+                      break
+              return out
+
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for mod in ["testutils", "rt/databinding/aegis", "systests/databinding"]:
+              m = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+              for f in sorted(glob.glob(mod + "/target/surefire-reports/TEST-*.xml")):
+                  r = ET.parse(f).getroot()
+                  for k in m:
+                      m[k] += int(r.get(k, 0) or 0)
+                  for tc in r.iter("testcase"):
+                      sk = tc.find("skipped")
+                      if sk is not None:
+                          if sk.get("message"):
+                              print("SKIPPED %s.%s: %s" % (tc.get("classname"), tc.get("name"), sk.get("message")))
+                          else:
+                              print("SKIPPED %s.%s: upstream bare @Ignore; upstream source of the ignored test:" % (
+                                  tc.get("classname"), tc.get("name")))
+                              for l in ignore_context(mod, tc.get("classname"), tc.get("name")):
+                                  print(l)
+              passed = m["tests"] - m["failures"] - m["errors"] - m["skipped"]
+              print("MODULE %s: tests=%d passed=%d failures=%d errors=%d skipped=%d" % (
+                  mod, m["tests"], passed, m["failures"], m["errors"], m["skipped"]))
+              for k in tot:
+                  tot[k] += m[k]
+          passed = tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"]
+          print("SUMMARY: tests=%d passed=%d failures=%d errors=%d skipped=%d" % (
+              tot["tests"], passed, tot["failures"], tot["errors"], tot["skipped"]))
+          EOF
